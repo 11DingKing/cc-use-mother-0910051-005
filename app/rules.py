@@ -333,6 +333,228 @@ def validate_order_price(unit_price: float) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def get_limit_standard_snapshot() -> Dict:
+    """
+    生成当前电耗限值标准的可序列化快照，用于封账时冻结标准。
+    无穷大重量上限序列化为 None，保证 JSON 可比较。
+    """
+    tiers = []
+    for tier in POWER_CONSUMPTION_LIMIT_TIERS:
+        tiers.append({
+            "min_weight": tier.min_weight,
+            "max_weight": None if tier.max_weight == float("inf") else tier.max_weight,
+            "limit": tier.limit,
+        })
+    return {
+        "tiers": tiers,
+        "credit_multiplier": CREDIT_MULTIPLIER,
+    }
+
+
+def calculate_limit_from_snapshot(curb_weight: float, standard: Dict) -> float:
+    """按封账快照中的限值标准计算电耗限值（不依赖全局常量，保证可复算）"""
+    tiers = standard.get("tiers") or []
+    for tier in tiers:
+        max_weight = tier.get("max_weight")
+        if max_weight is None:
+            if curb_weight >= tier["min_weight"]:
+                return tier["limit"]
+        elif tier["min_weight"] <= curb_weight <= max_weight:
+            return tier["limit"]
+    return tiers[-1]["limit"] if tiers else 0.0
+
+
+def calculate_unit_credit_with_multiplier(
+    actual_power_consumption: float, limit: float, multiplier: float
+) -> float:
+    """按指定积分系数计算单车积分（封账重算使用快照中的系数）"""
+    if limit <= 0 or actual_power_consumption < 0:
+        return 0.0
+    if actual_power_consumption == 0:
+        return round(multiplier, 4)
+    return round((limit - actual_power_consumption) / limit * multiplier, 4)
+
+
+def compute_credit_results(items: List[Dict], standard: Dict) -> Dict:
+    """
+    基于一份完整核算输入（车型明细列表）和限值标准快照，计算全部积分项。
+    返回 {"items": [...], "totals": {...}}，可直接冻结进封账快照。
+    """
+    multiplier = standard.get("credit_multiplier", CREDIT_MULTIPLIER)
+    result_items = []
+    for item in items:
+        limit = calculate_limit_from_snapshot(item["curb_weight"], standard)
+        unit_credit = calculate_unit_credit_with_multiplier(
+            item["power_consumption"], limit, multiplier
+        )
+        total_credit = calculate_total_credit(unit_credit, item["annual_output"])
+        result_items.append({
+            "model_code": item["model_code"],
+            "model_name": item.get("model_name", ""),
+            "curb_weight": item["curb_weight"],
+            "power_consumption": item["power_consumption"],
+            "annual_output": item["annual_output"],
+            "power_consumption_limit": limit,
+            "unit_credit": unit_credit,
+            "total_credit": total_credit,
+            "is_compliant": item["power_consumption"] <= limit,
+        })
+
+    total_positive = round(sum(i["total_credit"] for i in result_items if i["total_credit"] > 0), 2)
+    total_negative = round(sum(i["total_credit"] for i in result_items if i["total_credit"] < 0), 2)
+    net_credit = round(total_positive + total_negative, 2)
+    required_credit = round(abs(total_negative), 2) if total_negative < 0 else 0.0
+    credit_gap = round(max(0.0, required_credit - total_positive), 2)
+    credit_surplus = round(max(0.0, total_positive - required_credit), 2)
+
+    return {
+        "items": result_items,
+        "totals": {
+            "total_positive_credit": total_positive,
+            "total_negative_credit": total_negative,
+            "net_credit": net_credit,
+            "required_credit": required_credit,
+            "credit_gap": credit_gap,
+            "credit_surplus": credit_surplus,
+            "model_count": len(result_items),
+            "compliant_model_count": sum(1 for i in result_items if i["is_compliant"]),
+            "total_output": sum(i["annual_output"] for i in result_items),
+        },
+    }
+
+
+CREDIT_ITEM_NUMERIC_FIELDS = [
+    "curb_weight", "power_consumption", "annual_output",
+    "power_consumption_limit", "unit_credit", "total_credit",
+]
+
+CREDIT_TOTAL_FIELDS = [
+    "total_positive_credit", "total_negative_credit", "net_credit",
+    "required_credit", "credit_gap", "credit_surplus",
+]
+
+
+def diff_credit_results(old_result: Dict, new_result: Dict, standard_changed: bool = False) -> Dict:
+    """
+    对比两次封账的计算结果，给出各积分项差异。
+    逐项（车型）给出字段级增量，并给出合计差异；未变化项只计数不展开。
+    """
+    old_items = {i["model_code"]: i for i in old_result.get("items", [])}
+    new_items = {i["model_code"]: i for i in new_result.get("items", [])}
+
+    item_diffs = []
+    unchanged_count = 0
+    for code in sorted(set(old_items) | set(new_items)):
+        old_item = old_items.get(code)
+        new_item = new_items.get(code)
+        if old_item is not None and new_item is not None:
+            delta = {}
+            for field in CREDIT_ITEM_NUMERIC_FIELDS:
+                change = round((new_item.get(field) or 0) - (old_item.get(field) or 0), 4)
+                if abs(change) > 1e-9:
+                    delta[field] = change
+            if delta:
+                item_diffs.append({
+                    "model_code": code,
+                    "model_name": new_item.get("model_name", ""),
+                    "change_type": "modified",
+                    "old": old_item,
+                    "new": new_item,
+                    "delta": delta,
+                })
+            else:
+                unchanged_count += 1
+        elif new_item is not None:
+            item_diffs.append({
+                "model_code": code,
+                "model_name": new_item.get("model_name", ""),
+                "change_type": "added",
+                "old": None,
+                "new": new_item,
+                "delta": None,
+            })
+        else:
+            item_diffs.append({
+                "model_code": code,
+                "model_name": old_item.get("model_name", ""),
+                "change_type": "removed",
+                "old": old_item,
+                "new": None,
+                "delta": None,
+            })
+
+    old_totals = old_result.get("totals", {})
+    new_totals = new_result.get("totals", {})
+    totals_delta = {
+        field: round((new_totals.get(field) or 0) - (old_totals.get(field) or 0), 4)
+        for field in CREDIT_TOTAL_FIELDS
+    }
+
+    return {
+        "items": item_diffs,
+        "unchanged_item_count": unchanged_count,
+        "totals": {
+            "old": old_totals,
+            "new": new_totals,
+            "delta": totals_delta,
+        },
+        "limit_standard_changed": standard_changed,
+    }
+
+
+INPUT_ITEM_COMPARE_FIELDS = [
+    "model_name", "curb_weight", "power_consumption", "range_km", "annual_output",
+]
+
+
+def diff_input_items(old_items: List[Dict], new_items: List[Dict]) -> Dict:
+    """
+    对比两个核算输入版本的车型明细，给出字段级差异。
+    用于说明两次提交之间凭证数据发生了什么变化。
+    """
+    old_by_code = {i["model_code"]: i for i in old_items}
+    new_by_code = {i["model_code"]: i for i in new_items}
+
+    added, removed, changed = [], [], []
+    unchanged_count = 0
+    for code in sorted(set(old_by_code) | set(new_by_code)):
+        old_item = old_by_code.get(code)
+        new_item = new_by_code.get(code)
+        if old_item is None:
+            added.append(new_item)
+        elif new_item is None:
+            removed.append(old_item)
+        else:
+            field_changes = {}
+            for field in INPUT_ITEM_COMPARE_FIELDS:
+                if old_item.get(field) != new_item.get(field):
+                    field_changes[field] = {
+                        "old": old_item.get(field),
+                        "new": new_item.get(field),
+                    }
+            if field_changes:
+                changed.append({
+                    "model_code": code,
+                    "model_name": new_item.get("model_name", ""),
+                    "field_changes": field_changes,
+                })
+            else:
+                unchanged_count += 1
+
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "unchanged_count": unchanged_count,
+        "summary": {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": unchanged_count,
+        },
+    }
+
+
 @dataclass
 class PredictionResult:
     total_positive: float
@@ -422,4 +644,6 @@ class EnterpriseCreditSummaryV2(EnterpriseCreditSummary):
     final_credit_gap: float = 0.0
     final_credit_surplus: float = 0.0
     is_compliant: bool = True
+    closure_id: Optional[int] = None
+    closure_no: Optional[str] = None
 

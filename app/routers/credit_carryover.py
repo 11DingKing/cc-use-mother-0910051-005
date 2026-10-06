@@ -138,7 +138,15 @@ def get_annual_summary(
     db: Session = Depends(get_db)
 ):
     summary = crud.update_annual_summary_with_transactions(db, enterprise_id=enterprise_id, year=year)
-    return summary
+    enterprise = crud.get_enterprise(db, enterprise_id)
+    if not enterprise:
+        raise HTTPException(status_code=404, detail="企业不存在")
+    result = {c.name: getattr(summary, c.name) for c in summary.__table__.columns}
+    result["enterprise"] = enterprise
+    if summary.closure_id is not None:
+        closure = crud.get_accounting_closure(db, summary.closure_id)
+        result["closure_no"] = closure.closure_no if closure else None
+    return result
 
 
 @router.get("/enterprise-credits-v2/{year}", response_model=List[dict])
@@ -169,7 +177,9 @@ def get_enterprise_credit_summaries_v2(
             "final_net_credit": s.final_net_credit,
             "final_credit_gap": s.final_credit_gap,
             "final_credit_surplus": s.final_credit_surplus,
-            "is_compliant": s.is_compliant
+            "is_compliant": s.is_compliant,
+            "closure_id": s.closure_id,
+            "closure_no": s.closure_no
         }
         for s in summaries
     ]
@@ -205,5 +215,7 @@ def get_single_enterprise_summary_v2(
         "final_net_credit": summary.final_net_credit,
         "final_credit_gap": summary.final_credit_gap,
         "final_credit_surplus": summary.final_credit_surplus,
-        "is_compliant": summary.is_compliant
+        "is_compliant": summary.is_compliant,
+        "closure_id": summary.closure_id,
+        "closure_no": summary.closure_no
     }

@@ -1,8 +1,11 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 
-from .models import CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus
+from .models import (
+    CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus,
+    InputVersionStatus, ClosureStatus, ReopenDecisionStatus
+)
 
 
 class EnterpriseBase(BaseModel):
@@ -376,6 +379,7 @@ class CreditCarryover(CreditCarryoverBase):
     used_amount: float
     remaining_amount: float
     status: CarryoverStatus
+    source_closure_id: Optional[int] = None
     created_at: datetime
     approved_at: Optional[datetime] = None
 
@@ -412,6 +416,7 @@ class AnnualCreditSummaryCreate(AnnualCreditSummaryBase):
 
 class AnnualCreditSummary(AnnualCreditSummaryBase):
     id: int
+    closure_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -421,6 +426,7 @@ class AnnualCreditSummary(AnnualCreditSummaryBase):
 
 class AnnualCreditSummaryWithDetail(AnnualCreditSummary):
     enterprise: Enterprise
+    closure_no: Optional[str] = None
     carryovers: List[CreditCarryover] = []
     transactions: List[CreditTransactionWithDetail] = []
 
@@ -513,6 +519,140 @@ class CarryoverSummaryResponse(BaseModel):
     used_amount: float
     remaining_amount: float
     status: str
+    source_closure_id: Optional[int] = None
+    source_closure_no: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 核算输入版本与封账
+# ---------------------------------------------------------------------------
+
+class AccountingInputItemBase(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_code: str = Field(..., max_length=50, description="车型代码")
+    model_name: str = Field(..., max_length=100, description="车型名称")
+    curb_weight: float = Field(..., gt=0, description="整备质量(kg)")
+    power_consumption: float = Field(..., gt=0, description="百公里电耗(kWh/100km)")
+    range_km: float = Field(..., gt=0, description="续航里程(km)")
+    annual_output: int = Field(..., ge=0, description="年产量(辆)")
+
+
+class AccountingInputItemCreate(AccountingInputItemBase):
+    pass
+
+
+class AccountingInputItem(AccountingInputItemBase):
+    id: int
+    version_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class AccountingInputVersionCreate(BaseModel):
+    enterprise_id: int = Field(..., description="企业ID")
+    year: int = Field(..., description="核算年度")
+    submitted_by: str = Field(..., min_length=1, max_length=50, description="提交人")
+    note: Optional[str] = Field(None, max_length=500, description="提交说明（如：补交产量和能耗凭证）")
+    items: List[AccountingInputItemCreate] = Field(..., min_length=1, description="完整车型明细")
+
+
+class AccountingInputVersion(BaseModel):
+    id: int
+    enterprise_id: int
+    year: int
+    version_no: int
+    status: InputVersionStatus
+    submitted_by: str
+    note: Optional[str] = None
+    created_at: datetime
+    items: List[AccountingInputItem] = []
+
+    class Config:
+        from_attributes = True
+
+
+class InputVersionCompareResponse(BaseModel):
+    version_a: dict
+    version_b: dict
+    added: List[dict]
+    removed: List[dict]
+    changed: List[dict]
+    unchanged_count: int
+    summary: dict
+
+
+class AccountingClosureSealRequest(BaseModel):
+    enterprise_id: int = Field(..., description="企业ID")
+    year: int = Field(..., description="核算年度")
+    input_version_id: int = Field(..., description="监管确认采用的核算输入版本ID")
+    sealed_by: str = Field(..., min_length=1, max_length=50, description="监管确认人")
+    remark: Optional[str] = Field(None, max_length=500)
+
+
+class AccountingClosure(BaseModel):
+    id: int
+    closure_no: str
+    enterprise_id: int
+    year: int
+    input_version_id: int
+    status: ClosureStatus
+    sealed_by: str
+    sealed_at: Optional[datetime] = None
+    previous_closure_id: Optional[int] = None
+    reopen_decision_id: Optional[int] = None
+    remark: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AccountingClosureDetail(AccountingClosure):
+    limit_standard_snapshot: dict
+    result_snapshot: dict
+    diff_from_previous: Optional[dict] = None
+
+
+class ReopenDecisionCreate(BaseModel):
+    year: int = Field(..., description="重开的核算年度")
+    enterprise_ids: List[int] = Field(..., min_length=1, description="受影响企业ID列表")
+    reason: str = Field(..., min_length=1, max_length=500, description="重开理由")
+    approved_by: str = Field(..., min_length=1, max_length=50, description="审批人（权限记录）")
+    input_version_map: Optional[Dict[int, int]] = Field(
+        None, description="各企业指定重算的核算输入版本 {企业ID: 版本ID}，缺省使用最新提交版本"
+    )
+    remark: Optional[str] = Field(None, max_length=500)
+
+
+class ReopenDecision(BaseModel):
+    id: int
+    decision_no: str
+    year: int
+    enterprise_ids: List[int]
+    input_version_map: Dict[str, int] = {}
+    reason: str
+    approved_by: str
+    status: ReopenDecisionStatus
+    remark: Optional[str] = None
+    created_at: datetime
+    executed_at: Optional[datetime] = None
+
+
+class ReopenDecisionDetail(ReopenDecision):
+    execution_result: Optional[dict] = None
+
+
+class ReopenExecutionResponse(BaseModel):
+    decision_id: int
+    decision_no: str
+    year: int
+    success_count: int
+    failure_count: int
+    closures_created: List[dict]
+    failures: List[dict]
+    message: str = ""
 
 
 CreditOrderWithDetail.model_rebuild()

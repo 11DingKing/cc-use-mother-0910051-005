@@ -1,3 +1,4 @@
+import json
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
@@ -17,6 +18,10 @@ from .rules import (
     validate_order_price,
     predict_next_year_credit,
     EnterpriseCreditSummaryV2,
+    get_limit_standard_snapshot,
+    compute_credit_results,
+    diff_credit_results,
+    diff_input_items,
     PRICE_FLOOR,
     PRICE_CEILING,
     DEFAULT_MARKET_PRICE,
@@ -26,7 +31,10 @@ from .models import (
     CreditRecordStatus,
     OrderType,
     OrderStatus,
-    CarryoverStatus
+    CarryoverStatus,
+    InputVersionStatus,
+    ClosureStatus,
+    ReopenDecisionStatus
 )
 
 VALID_STATUS_TRANSITIONS = {
@@ -1048,6 +1056,12 @@ def execute_yearly_carryover(
                 )
 
                 db_carryover = create_credit_carryover(db, carryover_create)
+
+                # 结转必须明确依据哪次封账：记录来源年度当前有效封账
+                src_closure = get_active_closure(db, enterprise.id, src_year)
+                if src_closure is not None:
+                    db_carryover.source_closure_id = src_closure.id
+
                 carryovers.append(db_carryover)
 
                 src_summary.carryover_out = round(src_summary.carryover_out + carryover_amount, 2)
@@ -1092,6 +1106,10 @@ def get_carryover_summary(
     result = []
     for c in carryovers:
         enterprise = get_enterprise(db, c.enterprise_id)
+        source_closure_no = None
+        if c.source_closure_id is not None:
+            closure = get_accounting_closure(db, c.source_closure_id)
+            source_closure_no = closure.closure_no if closure else None
         result.append(schemas.CarryoverSummaryResponse(
             enterprise_id=c.enterprise_id,
             enterprise_name=enterprise.name if enterprise else "",
@@ -1102,14 +1120,16 @@ def get_carryover_summary(
             carryover_amount=c.carryover_amount,
             used_amount=c.used_amount,
             remaining_amount=c.remaining_amount,
-            status=c.status.value
+            status=c.status.value,
+            source_closure_id=c.source_closure_id,
+            source_closure_no=source_closure_no
         ))
 
     return result
 
 
 def get_or_create_annual_summary(
-    db: Session, enterprise_id: int, year: int
+    db: Session, enterprise_id: int, year: int, commit: bool = True
 ) -> models.AnnualCreditSummary:
     existing = db.query(models.AnnualCreditSummary).filter(
         models.AnnualCreditSummary.enterprise_id == enterprise_id,
@@ -1124,23 +1144,42 @@ def get_or_create_annual_summary(
         year=year
     )
     db.add(db_summary)
-    db.commit()
-    db.refresh(db_summary)
+    if commit:
+        db.commit()
+        db.refresh(db_summary)
+    else:
+        db.flush()
     return db_summary
 
 
 def update_annual_summary_with_transactions(
-    db: Session, enterprise_id: int, year: int
+    db: Session, enterprise_id: int, year: int, commit: bool = True
 ) -> models.AnnualCreditSummary:
-    summary = get_or_create_annual_summary(db, enterprise_id, year)
-    base_summary = calculate_enterprise_credit_summary(db, enterprise_id, year)
+    """
+    刷新企业年度汇总。若该企业当年存在有效封账，则当年核算口径
+    （正/负/净积分）以封账冻结结果为准，并记录所采用的封账ID，
+    保证下游年度汇总可以明确追溯采用了哪次封账。
+    """
+    summary = get_or_create_annual_summary(db, enterprise_id, year, commit=commit)
 
-    if base_summary:
-        summary.total_positive_credit = base_summary.total_positive_credit
-        summary.total_negative_credit = base_summary.total_negative_credit
-        summary.net_credit = base_summary.net_credit
-        summary.credit_gap = base_summary.credit_gap
-        summary.credit_surplus = base_summary.credit_surplus
+    closure = get_active_closure(db, enterprise_id, year)
+    if closure is not None:
+        closure_totals = json.loads(closure.result_snapshot)["totals"]
+        summary.total_positive_credit = closure_totals["total_positive_credit"]
+        summary.total_negative_credit = closure_totals["total_negative_credit"]
+        summary.net_credit = closure_totals["net_credit"]
+        summary.credit_gap = closure_totals["credit_gap"]
+        summary.credit_surplus = closure_totals["credit_surplus"]
+        summary.closure_id = closure.id
+    else:
+        base_summary = calculate_enterprise_credit_summary(db, enterprise_id, year)
+        if base_summary:
+            summary.total_positive_credit = base_summary.total_positive_credit
+            summary.total_negative_credit = base_summary.total_negative_credit
+            summary.net_credit = base_summary.net_credit
+            summary.credit_gap = base_summary.credit_gap
+            summary.credit_surplus = base_summary.credit_surplus
+        summary.closure_id = None
 
     transactions = get_credit_transactions(db, enterprise_id=enterprise_id, limit=10000)
     bought = 0.0
@@ -1187,8 +1226,11 @@ def update_annual_summary_with_transactions(
         summary.is_compliant = False
 
     summary.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(summary)
+    if commit:
+        db.commit()
+        db.refresh(summary)
+    else:
+        db.flush()
     return summary
 
 
@@ -1199,15 +1241,31 @@ def calculate_enterprise_credit_summary_v2(
 
     annual_summary = update_annual_summary_with_transactions(db, enterprise_id, year)
 
+    closure_no = None
+    closure_totals = None
+    if annual_summary.closure_id is not None:
+        closure = get_accounting_closure(db, annual_summary.closure_id)
+        if closure:
+            closure_no = closure.closure_no
+            closure_totals = json.loads(closure.result_snapshot)["totals"]
+
+    # 存在有效封账时，当年核算口径以封账冻结结果为准（与监管公布一致）
+    total_positive = closure_totals["total_positive_credit"] if closure_totals else base_summary.total_positive_credit
+    total_negative = closure_totals["total_negative_credit"] if closure_totals else base_summary.total_negative_credit
+    net_credit = closure_totals["net_credit"] if closure_totals else base_summary.net_credit
+    required_credit = closure_totals["required_credit"] if closure_totals else base_summary.required_credit
+    base_gap = closure_totals["credit_gap"] if closure_totals else base_summary.credit_gap
+    base_surplus = closure_totals["credit_surplus"] if closure_totals else base_summary.credit_surplus
+
     v2_summary = EnterpriseCreditSummaryV2(
         enterprise_id=base_summary.enterprise_id,
         enterprise_name=base_summary.enterprise_name,
-        total_positive_credit=base_summary.total_positive_credit,
-        total_negative_credit=base_summary.total_negative_credit,
-        net_credit=base_summary.net_credit,
-        required_credit=base_summary.required_credit,
-        credit_gap=base_summary.credit_gap,
-        credit_surplus=base_summary.credit_surplus,
+        total_positive_credit=total_positive,
+        total_negative_credit=total_negative,
+        net_credit=net_credit,
+        required_credit=required_credit,
+        credit_gap=base_gap,
+        credit_surplus=base_surplus,
         compliance_rate=base_summary.compliance_rate,
         average_power_consumption=base_summary.average_power_consumption,
         weighted_power_consumption=base_summary.weighted_power_consumption,
@@ -1220,7 +1278,9 @@ def calculate_enterprise_credit_summary_v2(
         final_net_credit=annual_summary.final_net_credit,
         final_credit_gap=annual_summary.credit_gap,
         final_credit_surplus=annual_summary.credit_surplus,
-        is_compliant=annual_summary.is_compliant
+        is_compliant=annual_summary.is_compliant,
+        closure_id=annual_summary.closure_id,
+        closure_no=closure_no
     )
 
     return v2_summary
@@ -1254,6 +1314,10 @@ def get_multi_year_summary(
 
     for year in years:
         summary = update_annual_summary_with_transactions(db, enterprise_id, year)
+        closure_no = None
+        if summary.closure_id is not None:
+            closure = get_accounting_closure(db, summary.closure_id)
+            closure_no = closure.closure_no if closure else None
         annual_summaries.append({
             "year": year,
             "total_positive_credit": summary.total_positive_credit,
@@ -1266,7 +1330,9 @@ def get_multi_year_summary(
             "final_net_credit": summary.final_net_credit,
             "credit_gap": summary.credit_gap,
             "credit_surplus": summary.credit_surplus,
-            "is_compliant": summary.is_compliant
+            "is_compliant": summary.is_compliant,
+            "closure_id": summary.closure_id,
+            "closure_no": closure_no
         })
         total_carryover_in += summary.carryover_in
         total_carryover_out += summary.carryover_out
@@ -1410,4 +1476,441 @@ def update_credit_record(
         )
 
     return db_record
+
+
+# ---------------------------------------------------------------------------
+# 核算输入版本与封账
+# ---------------------------------------------------------------------------
+
+def _input_item_to_dict(item: models.AccountingInputItem) -> Dict:
+    return {
+        "model_code": item.model_code,
+        "model_name": item.model_name,
+        "curb_weight": item.curb_weight,
+        "power_consumption": item.power_consumption,
+        "range_km": item.range_km,
+        "annual_output": item.annual_output,
+    }
+
+
+def submit_accounting_input_version(
+    db: Session,
+    enterprise_id: int,
+    year: int,
+    items: List[Dict],
+    submitted_by: str,
+    note: Optional[str] = None
+) -> models.AccountingInputVersion:
+    """
+    企业提交核算输入（产量/能耗凭证），形成一份完整、可比较的输入版本。
+    版本一旦创建不可修改；同一企业同一年度再次提交会生成递增的新版本，
+    旧的未封账提交版本标记为已被取代，历史版本保留用于比较与追溯。
+    """
+    enterprise = get_enterprise(db, enterprise_id)
+    if not enterprise:
+        raise ValueError("企业不存在")
+    if not items:
+        raise ValueError("提交的核算输入不能为空，每次提交必须包含完整的车型明细")
+
+    model_codes = [item["model_code"] for item in items]
+    if len(model_codes) != len(set(model_codes)):
+        raise ValueError("同一次提交中车型代码不能重复")
+
+    max_no = db.query(func.max(models.AccountingInputVersion.version_no)).filter(
+        models.AccountingInputVersion.enterprise_id == enterprise_id,
+        models.AccountingInputVersion.year == year
+    ).scalar() or 0
+
+    db_version = models.AccountingInputVersion(
+        enterprise_id=enterprise_id,
+        year=year,
+        version_no=max_no + 1,
+        status=InputVersionStatus.SUBMITTED,
+        submitted_by=submitted_by,
+        note=note
+    )
+    db.add(db_version)
+    db.flush()
+
+    for item in items:
+        db.add(models.AccountingInputItem(version_id=db_version.id, **item))
+
+    # 旧的未封账提交版本被本次提交取代（已封账采用的版本保留原状态）
+    db.query(models.AccountingInputVersion).filter(
+        models.AccountingInputVersion.enterprise_id == enterprise_id,
+        models.AccountingInputVersion.year == year,
+        models.AccountingInputVersion.id != db_version.id,
+        models.AccountingInputVersion.status == InputVersionStatus.SUBMITTED
+    ).update({"status": InputVersionStatus.SUPERSEDED}, synchronize_session=False)
+
+    db.commit()
+    db.refresh(db_version)
+    return db_version
+
+
+def get_accounting_input_version(
+    db: Session, version_id: int
+) -> Optional[models.AccountingInputVersion]:
+    return db.query(models.AccountingInputVersion).filter(
+        models.AccountingInputVersion.id == version_id
+    ).first()
+
+
+def get_accounting_input_versions(
+    db: Session,
+    enterprise_id: Optional[int] = None,
+    year: Optional[int] = None,
+    status: Optional[InputVersionStatus] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> List[models.AccountingInputVersion]:
+    query = db.query(models.AccountingInputVersion)
+    if enterprise_id:
+        query = query.filter(models.AccountingInputVersion.enterprise_id == enterprise_id)
+    if year:
+        query = query.filter(models.AccountingInputVersion.year == year)
+    if status:
+        query = query.filter(models.AccountingInputVersion.status == status)
+    return query.order_by(
+        models.AccountingInputVersion.enterprise_id,
+        models.AccountingInputVersion.year,
+        models.AccountingInputVersion.version_no
+    ).offset(skip).limit(limit).all()
+
+
+def get_latest_input_version(
+    db: Session, enterprise_id: int, year: int
+) -> Optional[models.AccountingInputVersion]:
+    return db.query(models.AccountingInputVersion).filter(
+        models.AccountingInputVersion.enterprise_id == enterprise_id,
+        models.AccountingInputVersion.year == year
+    ).order_by(models.AccountingInputVersion.version_no.desc()).first()
+
+
+def compare_input_versions(
+    db: Session, version_a_id: int, version_b_id: int
+) -> Dict:
+    """比较两个输入版本，给出车型明细的字段级差异"""
+    version_a = get_accounting_input_version(db, version_a_id)
+    version_b = get_accounting_input_version(db, version_b_id)
+    if not version_a or not version_b:
+        raise ValueError("输入版本不存在，无法比较")
+
+    old_items = [_input_item_to_dict(i) for i in version_a.items]
+    new_items = [_input_item_to_dict(i) for i in version_b.items]
+    diff = diff_input_items(old_items, new_items)
+    diff["version_a"] = {"id": version_a.id, "version_no": version_a.version_no,
+                         "enterprise_id": version_a.enterprise_id, "year": version_a.year}
+    diff["version_b"] = {"id": version_b.id, "version_no": version_b.version_no,
+                         "enterprise_id": version_b.enterprise_id, "year": version_b.year}
+    return diff
+
+
+def generate_closure_no(db: Session, year: int) -> str:
+    max_id = db.query(func.max(models.AccountingClosure.id)).scalar() or 0
+    return f"CL{year}-{max_id + 1:05d}"
+
+
+def get_active_closure(
+    db: Session, enterprise_id: int, year: int
+) -> Optional[models.AccountingClosure]:
+    """企业当年当前有效（SEALED）的封账，下游结转/汇总/交易可用额以此为准"""
+    return db.query(models.AccountingClosure).filter(
+        models.AccountingClosure.enterprise_id == enterprise_id,
+        models.AccountingClosure.year == year,
+        models.AccountingClosure.status == ClosureStatus.SEALED
+    ).order_by(models.AccountingClosure.id.desc()).first()
+
+
+def get_accounting_closure(db: Session, closure_id: int) -> Optional[models.AccountingClosure]:
+    return db.query(models.AccountingClosure).filter(
+        models.AccountingClosure.id == closure_id
+    ).first()
+
+
+def get_accounting_closures(
+    db: Session,
+    enterprise_id: Optional[int] = None,
+    year: Optional[int] = None,
+    status: Optional[ClosureStatus] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> List[models.AccountingClosure]:
+    query = db.query(models.AccountingClosure)
+    if enterprise_id:
+        query = query.filter(models.AccountingClosure.enterprise_id == enterprise_id)
+    if year:
+        query = query.filter(models.AccountingClosure.year == year)
+    if status:
+        query = query.filter(models.AccountingClosure.status == status)
+    return query.order_by(models.AccountingClosure.id).offset(skip).limit(limit).all()
+
+
+def seal_accounting(
+    db: Session,
+    enterprise_id: int,
+    year: int,
+    input_version_id: int,
+    sealed_by: str,
+    remark: Optional[str] = None
+) -> models.AccountingClosure:
+    """
+    监管确认封账：冻结当期核算输入版本、限值标准与计算结果。
+    已存在有效封账时禁止直接再次封账，必须通过重开决定流程重算，
+    防止已公布积分被悄悄改写。
+    """
+    enterprise = get_enterprise(db, enterprise_id)
+    if not enterprise:
+        raise ValueError("企业不存在")
+
+    version = get_accounting_input_version(db, input_version_id)
+    if not version:
+        raise ValueError("核算输入版本不存在")
+    if version.enterprise_id != enterprise_id or version.year != year:
+        raise ValueError("核算输入版本与企业或年度不匹配")
+
+    existing = get_active_closure(db, enterprise_id, year)
+    if existing:
+        raise ValueError(
+            f"该企业{year}年度已存在有效封账({existing.closure_no})，"
+            f"如需依据补交凭证重算，请先登记重开决定"
+        )
+
+    standard = get_limit_standard_snapshot()
+    items = [_input_item_to_dict(i) for i in version.items]
+    result = compute_credit_results(items, standard)
+
+    db_closure = models.AccountingClosure(
+        closure_no=generate_closure_no(db, year),
+        enterprise_id=enterprise_id,
+        year=year,
+        input_version_id=version.id,
+        limit_standard_snapshot=json.dumps(standard, ensure_ascii=False),
+        result_snapshot=json.dumps(result, ensure_ascii=False),
+        diff_from_previous=None,
+        previous_closure_id=None,
+        reopen_decision_id=None,
+        status=ClosureStatus.SEALED,
+        sealed_by=sealed_by,
+        sealed_at=datetime.utcnow(),
+        remark=remark
+    )
+    db.add(db_closure)
+    db.flush()
+
+    version.status = InputVersionStatus.SEALED
+    db.commit()
+    db.refresh(db_closure)
+
+    # 年度汇总立即切换到本次封账口径
+    update_annual_summary_with_transactions(db, enterprise_id, year)
+
+    return db_closure
+
+
+def generate_decision_no(db: Session, year: int) -> str:
+    max_id = db.query(func.max(models.ReopenDecision.id)).scalar() or 0
+    return f"RD{year}-{max_id + 1:04d}"
+
+
+def create_reopen_decision(
+    db: Session,
+    year: int,
+    enterprise_ids: List[int],
+    reason: str,
+    approved_by: str,
+    input_version_map: Optional[Dict[int, int]] = None,
+    remark: Optional[str] = None
+) -> models.ReopenDecision:
+    """登记重开决定：记录理由、审批权限与受影响企业"""
+    if not reason or not reason.strip():
+        raise ValueError("重开必须记录理由")
+    if not approved_by or not approved_by.strip():
+        raise ValueError("重开必须记录审批人（权限）")
+    if not enterprise_ids:
+        raise ValueError("重开必须指定受影响企业")
+
+    unique_ids = []
+    for ent_id in enterprise_ids:
+        if ent_id not in unique_ids:
+            unique_ids.append(ent_id)
+        if not get_enterprise(db, ent_id):
+            raise ValueError(f"受影响企业不存在(ID:{ent_id})")
+
+    # 指定重算版本(input_version_map)不在登记时校验：
+    # 执行时逐企业验证，无效版本仅使该企业重算失败并保持其原封账结果
+    version_map = input_version_map or {}
+
+    db_decision = models.ReopenDecision(
+        decision_no=generate_decision_no(db, year),
+        year=year,
+        enterprise_ids=json.dumps(unique_ids),
+        input_version_map=json.dumps({str(k): v for k, v in version_map.items()}),
+        reason=reason,
+        approved_by=approved_by,
+        status=ReopenDecisionStatus.PENDING,
+        remark=remark
+    )
+    db.add(db_decision)
+    db.commit()
+    db.refresh(db_decision)
+    return db_decision
+
+
+def get_reopen_decision(db: Session, decision_id: int) -> Optional[models.ReopenDecision]:
+    return db.query(models.ReopenDecision).filter(
+        models.ReopenDecision.id == decision_id
+    ).first()
+
+
+def get_reopen_decisions(
+    db: Session,
+    year: Optional[int] = None,
+    status: Optional[ReopenDecisionStatus] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> List[models.ReopenDecision]:
+    query = db.query(models.ReopenDecision)
+    if year:
+        query = query.filter(models.ReopenDecision.year == year)
+    if status:
+        query = query.filter(models.ReopenDecision.status == status)
+    return query.order_by(models.ReopenDecision.id).offset(skip).limit(limit).all()
+
+
+def _recalculate_closure_for_enterprise(
+    db: Session,
+    decision: models.ReopenDecision,
+    enterprise_id: int,
+    version_map: Dict[int, int]
+) -> Dict:
+    """
+    基于指定输入版本为单个企业重算并生成新封账。
+    旧封账完整保留（置为 superseded），新封账记录与旧封账的各积分项差异，
+    年度汇总切换到新封账。任何失败都会抛出异常，由调用方回滚保存点，
+    保证该企业维持原封账结果。
+    """
+    enterprise = get_enterprise(db, enterprise_id)
+    if not enterprise:
+        raise ValueError(f"受影响企业不存在(ID:{enterprise_id})")
+
+    old_closure = get_active_closure(db, enterprise_id, decision.year)
+    if not old_closure:
+        raise ValueError("该企业当年无有效封账，无法重开，保持原状")
+
+    if enterprise_id in version_map:
+        input_version = get_accounting_input_version(db, version_map[enterprise_id])
+        if not input_version:
+            raise ValueError(f"指定的核算输入版本不存在(ID:{version_map[enterprise_id]})")
+        if input_version.enterprise_id != enterprise_id or input_version.year != decision.year:
+            raise ValueError("指定的核算输入版本与企业或年度不匹配")
+    else:
+        input_version = get_latest_input_version(db, enterprise_id, decision.year)
+        if not input_version:
+            raise ValueError("该企业当年没有可用于重算的核算输入版本")
+
+    standard = get_limit_standard_snapshot()
+    items = [_input_item_to_dict(i) for i in input_version.items]
+    new_result = compute_credit_results(items, standard)
+
+    old_result = json.loads(old_closure.result_snapshot)
+    old_standard = json.loads(old_closure.limit_standard_snapshot)
+    standard_changed = old_standard != standard
+
+    diff = diff_credit_results(old_result, new_result, standard_changed)
+    diff["previous_closure_id"] = old_closure.id
+    diff["previous_closure_no"] = old_closure.closure_no
+    diff["input_version_id"] = input_version.id
+    diff["input_version_no"] = input_version.version_no
+
+    new_closure = models.AccountingClosure(
+        closure_no=generate_closure_no(db, decision.year),
+        enterprise_id=enterprise_id,
+        year=decision.year,
+        input_version_id=input_version.id,
+        limit_standard_snapshot=json.dumps(standard, ensure_ascii=False),
+        result_snapshot=json.dumps(new_result, ensure_ascii=False),
+        diff_from_previous=json.dumps(diff, ensure_ascii=False),
+        previous_closure_id=old_closure.id,
+        reopen_decision_id=decision.id,
+        status=ClosureStatus.SEALED,
+        sealed_by=decision.approved_by,
+        sealed_at=datetime.utcnow(),
+        remark=f"依据重开决定 {decision.decision_no} 重算生成"
+    )
+    db.add(new_closure)
+    db.flush()
+
+    # 旧封账不覆盖、不删除，仅标记为已被取代，历史结论可回溯
+    old_closure.status = ClosureStatus.SUPERSEDED
+    input_version.status = InputVersionStatus.SEALED
+    db.flush()
+
+    # 年度汇总切换到新封账口径（commit=False，随保存点一起提交或回滚）
+    update_annual_summary_with_transactions(db, enterprise_id, decision.year, commit=False)
+
+    return {
+        "enterprise_id": enterprise_id,
+        "enterprise_name": enterprise.name,
+        "new_closure_id": new_closure.id,
+        "new_closure_no": new_closure.closure_no,
+        "previous_closure_id": old_closure.id,
+        "previous_closure_no": old_closure.closure_no,
+        "input_version_id": input_version.id,
+        "input_version_no": input_version.version_no,
+        "limit_standard_changed": standard_changed,
+        "totals_delta": diff["totals"]["delta"],
+    }
+
+
+def execute_reopen_decision(db: Session, decision_id: int) -> Optional[Dict]:
+    """
+    执行重开决定：对受影响企业逐一基于指定版本重算并生成新封账。
+
+    - 幂等：同一决定重复执行直接返回首次执行结果，不再生成新版本；
+    - 失败隔离：单个企业重算失败仅回滚该企业，保持其原封账结果，
+      其余企业继续执行，失败原因记录在执行结果中。
+    """
+    decision = get_reopen_decision(db, decision_id)
+    if not decision:
+        return None
+
+    if decision.status == ReopenDecisionStatus.EXECUTED:
+        return json.loads(decision.execution_result)
+
+    enterprise_ids = json.loads(decision.enterprise_ids)
+    version_map = {int(k): v for k, v in json.loads(decision.input_version_map or "{}").items()}
+
+    closures_created = []
+    failures = []
+
+    for enterprise_id in enterprise_ids:
+        try:
+            # 保存点：单企业失败仅回滚本企业的变更，保持其原封账结果
+            with db.begin_nested():
+                outcome = _recalculate_closure_for_enterprise(
+                    db, decision, enterprise_id, version_map
+                )
+            closures_created.append(outcome)
+        except Exception as exc:  # 保存点已回滚，其余企业不受影响
+            failures.append({
+                "enterprise_id": enterprise_id,
+                "error": str(exc),
+                "action": "保持原封账结果",
+            })
+
+    decision.status = ReopenDecisionStatus.EXECUTED
+    decision.executed_at = datetime.utcnow()
+    result = {
+        "decision_id": decision.id,
+        "decision_no": decision.decision_no,
+        "year": decision.year,
+        "success_count": len(closures_created),
+        "failure_count": len(failures),
+        "closures_created": closures_created,
+        "failures": failures,
+    }
+    decision.execution_result = json.dumps(result, ensure_ascii=False)
+    db.commit()
+    return result
 

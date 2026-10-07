@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
 from . import models, schemas
+from . import sealing
 from .rules import (
     calculate_power_consumption_limit,
     calculate_unit_credit,
@@ -34,6 +35,17 @@ VALID_STATUS_TRANSITIONS = {
     CreditRecordStatus.PUBLICIZED: [CreditRecordStatus.CONFIRMED],
     CreditRecordStatus.CONFIRMED: []
 }
+
+
+def _ensure_year_not_sealed(db: Session, year: int) -> None:
+    """封账后当期核算输入与结果冻结，禁止直接改写（重开须走重开决定流程）。"""
+    if sealing.is_year_sealed(db, year):
+        active = sealing.get_active_seal(db, year)
+        seal_no = active.seal_no if active else ""
+        raise ValueError(
+            f"{year} 年度已封账（封账编号 {seal_no}），当期核算输入与结果已冻结；"
+            f"如需调整须凭监管重开决定基于指定版本重算，不能直接修改"
+        )
 
 
 def validate_status_transition(
@@ -116,6 +128,7 @@ def get_vehicle_models(
 
 
 def create_vehicle_model(db: Session, model: schemas.VehicleModelCreate) -> models.VehicleModel:
+    _ensure_year_not_sealed(db, model.production_year)
     is_suspicious = detect_weight_manipulation(
         model.curb_weight,
         model.power_consumption,
@@ -137,9 +150,13 @@ def update_vehicle_model(
     db_model = get_vehicle_model(db, model_id)
     if not db_model:
         return None
+    _ensure_year_not_sealed(db, db_model.production_year)
     update_data = model_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(db_model, key, value)
+
+    if "production_year" in update_data:
+        _ensure_year_not_sealed(db, db_model.production_year)
 
     if "curb_weight" in update_data or "power_consumption" in update_data or "range" in update_data:
         db_model.is_suspected_weight_manipulation = detect_weight_manipulation(
@@ -158,6 +175,7 @@ def delete_vehicle_model(db: Session, model_id: int) -> bool:
     db_model = get_vehicle_model(db, model_id)
     if not db_model:
         return False
+    _ensure_year_not_sealed(db, db_model.production_year)
     db.delete(db_model)
     db.commit()
     return True
@@ -195,6 +213,8 @@ def create_credit_record(db: Session, model_id: int, year: int) -> Optional[mode
     ).first()
     if existing:
         return existing
+
+    _ensure_year_not_sealed(db, year)
 
     result = calculate_vehicle_credit(db, model_id, year)
     if not result:
@@ -260,6 +280,9 @@ def update_credit_record_status(
     if not is_valid:
         raise ValueError(error_msg)
 
+    if db_record.seal_id:
+        raise ValueError("该积分记录已随封账冻结，不能再变更状态；如需调整须走重开重算流程")
+
     previous_status = db_record.status
     db_record.status = status
     now = datetime.utcnow()
@@ -297,6 +320,10 @@ def batch_update_credit_records_status(
     for record in records:
         is_valid, _ = validate_status_transition(record.status, status)
         if not is_valid:
+            continue
+
+        if record.seal_id:
+            # 封账冻结的记录不参与批量状态变更
             continue
 
         record.status = status
@@ -415,11 +442,15 @@ def create_credit_transaction(
     unit_price = transaction.unit_price or 3000.0
     total_amount = transaction.total_amount or (transaction.credit_amount * unit_price)
 
+    txn_year = datetime.now().year
+    active_seal = sealing.get_active_seal(db, txn_year)
+
     db_txn = models.CreditTransaction(
         **transaction.model_dump(exclude={"unit_price", "total_amount"}),
         transaction_no=txn_no,
         unit_price=unit_price,
-        total_amount=total_amount
+        total_amount=total_amount,
+        seal_id=active_seal.id if active_seal else None
     )
     db.add(db_txn)
     db.commit()
@@ -558,12 +589,15 @@ def create_credit_order(
     order_no = generate_order_no(db)
     expires_at = order.expires_at or (datetime.now() + timedelta(days=90))
 
+    active_seal = sealing.get_active_seal(db, order.year)
+
     db_order = models.CreditOrder(
         **order.model_dump(exclude={"expires_at"}),
         order_no=order_no,
         filled_amount=0.0,
         remaining_amount=order.total_amount,
-        expires_at=expires_at
+        expires_at=expires_at,
+        seal_id=active_seal.id if active_seal else None
     )
     db.add(db_order)
     db.commit()
@@ -693,7 +727,8 @@ def match_orders_by_id(
         transaction_no=generate_transaction_no(db),
         sell_order_id=sell_order.id,
         buy_order_id=buy_order.id,
-        status="completed"
+        status="completed",
+        seal_id=sell_order.seal_id
     )
     db.add(db_txn)
 
@@ -774,6 +809,9 @@ def match_all_pending_orders(
         matched_price = round(mr.matched_price, 2)
         total_amount = round(mr.total_amount, 2)
 
+        sell_order = get_credit_order(db, mr.sell_order_id)
+        buy_order = get_credit_order(db, mr.buy_order_id)
+
         txn_create = schemas.CreditTransactionCreate(
             from_enterprise_id=mr.sell_enterprise_id,
             to_enterprise_id=mr.buy_enterprise_id,
@@ -788,13 +826,11 @@ def match_all_pending_orders(
             transaction_no=f"TXN{base_timestamp}{i+1:04d}",
             sell_order_id=mr.sell_order_id,
             buy_order_id=mr.buy_order_id,
-            status="completed"
+            status="completed",
+            seal_id=sell_order.seal_id if sell_order else None
         )
         db.add(db_txn)
         transactions.append(db_txn)
-
-        sell_order = get_credit_order(db, mr.sell_order_id)
-        buy_order = get_credit_order(db, mr.buy_order_id)
 
         if sell_order:
             sell_order.filled_amount = round(sell_order.filled_amount + credit_amount, 2)
@@ -949,12 +985,15 @@ def create_credit_carryover(
 ) -> models.CreditCarryover:
     carryover_no = generate_carryover_no(db)
 
+    active_seal = sealing.get_active_seal(db, carryover.from_year)
+
     db_carryover = models.CreditCarryover(
         **carryover.model_dump(),
         carryover_no=carryover_no,
         used_amount=0.0,
         remaining_amount=carryover.carryover_amount,
-        approved_at=datetime.utcnow()
+        approved_at=datetime.utcnow(),
+        seal_id=active_seal.id if active_seal else None
     )
     db.add(db_carryover)
     db.commit()
@@ -1133,6 +1172,15 @@ def update_annual_summary_with_transactions(
     db: Session, enterprise_id: int, year: int
 ) -> models.AnnualCreditSummary:
     summary = get_or_create_annual_summary(db, enterprise_id, year)
+
+    if summary.seal_id:
+        # 已采用某次封账：正/负/净积分口径冻结，只随交易与结转滚动衍生字段，
+        # 绝不依据车型主数据或旧积分记录悄悄改写已公布结论。
+        sealing._refresh_derived_summary_fields(db, summary)
+        db.commit()
+        db.refresh(summary)
+        return summary
+
     base_summary = calculate_enterprise_credit_summary(db, enterprise_id, year)
 
     if base_summary:

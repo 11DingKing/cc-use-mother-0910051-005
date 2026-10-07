@@ -1,5 +1,6 @@
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+import json
 
 
 @dataclass
@@ -24,6 +25,8 @@ POWER_CONSUMPTION_LIMIT_TIERS: List[PowerConsumptionLimitTier] = [
 
 
 CREDIT_MULTIPLIER = 2.5
+
+RULE_VERSION = "PC-LIMIT-2024-V1"
 
 WEIGHT_MANIPULATION_THRESHOLD_RATIO = 0.008
 
@@ -53,6 +56,26 @@ def calculate_power_consumption_limit(curb_weight: float) -> float:
             if tier.min_weight <= curb_weight <= tier.max_weight:
                 return tier.limit
     return POWER_CONSUMPTION_LIMIT_TIERS[-1].limit
+
+
+def serialize_limit_standard() -> dict:
+    """生成当前生效限值标准的可比较快照（档位、倍率、规则版本）"""
+    return {
+        "rule_version": RULE_VERSION,
+        "credit_multiplier": CREDIT_MULTIPLIER,
+        "tiers": [
+            {
+                "min_weight": t.min_weight,
+                "max_weight": None if t.max_weight == float('inf') else t.max_weight,
+                "limit": t.limit,
+            }
+            for t in POWER_CONSUMPTION_LIMIT_TIERS
+        ],
+    }
+
+
+def limit_standard_json() -> str:
+    return json.dumps(serialize_limit_standard(), ensure_ascii=False, sort_keys=True)
 
 
 def calculate_unit_credit(actual_power_consumption: float, limit: float) -> float:

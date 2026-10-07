@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -157,6 +157,7 @@ class CreditTransaction(CreditTransactionBase):
     transaction_no: str
     transaction_date: datetime
     status: str
+    seal_id: Optional[int] = None
     created_at: datetime
 
     class Config:
@@ -284,6 +285,7 @@ class CreditOrder(CreditOrderBase):
     filled_amount: float
     remaining_amount: float
     status: OrderStatus
+    seal_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -376,6 +378,7 @@ class CreditCarryover(CreditCarryoverBase):
     used_amount: float
     remaining_amount: float
     status: CarryoverStatus
+    seal_id: Optional[int] = None
     created_at: datetime
     approved_at: Optional[datetime] = None
 
@@ -404,6 +407,8 @@ class AnnualCreditSummaryBase(BaseModel):
     credit_gap: float = 0.0
     credit_surplus: float = 0.0
     is_compliant: bool = True
+    seal_id: Optional[int] = None
+    input_version_id: Optional[int] = None
 
 
 class AnnualCreditSummaryCreate(AnnualCreditSummaryBase):
@@ -516,3 +521,190 @@ class CarryoverSummaryResponse(BaseModel):
 
 
 CreditOrderWithDetail.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# 核算输入版本、封账、重开重算
+# ---------------------------------------------------------------------------
+
+class InputVersionItemSubmit(BaseModel):
+    model_code: str = Field(..., max_length=50, description="车型代码（须为本企业该年度车型）")
+    curb_weight: Optional[float] = Field(None, gt=0, description="补交整备质量(kg)")
+    power_consumption: Optional[float] = Field(None, gt=0, description="补交百公里电耗")
+    range_km: Optional[float] = Field(None, gt=0, alias="range", description="补交续航里程(km)")
+    annual_output: Optional[int] = Field(None, ge=0, description="补交年产量(辆)")
+    evidence_no: Optional[str] = Field(None, max_length=100, description="凭证编号")
+
+    model_config = {"populate_by_name": True}
+
+
+class InputVersionSubmit(BaseModel):
+    enterprise_id: int
+    year: int
+    submitter: str = Field(..., max_length=100, description="提交人/企业经办人")
+    evidence_doc_no: Optional[str] = Field(None, max_length=100, description="本次补交凭证批次号")
+    remark: Optional[str] = None
+    items: Optional[List[InputVersionItemSubmit]] = Field(
+        None, description="变动车型覆盖项；未列出车型以主数据计入，版本始终完整"
+    )
+
+
+class InputVersionItemOut(BaseModel):
+    id: int
+    vehicle_model_id: int
+    model_code: str
+    model_name: str
+    curb_weight: float
+    power_consumption: float
+    range_km: float
+    annual_output: int
+    evidence_no: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LimitStandardSnapshotOut(BaseModel):
+    id: int
+    tiers_json: str
+    credit_multiplier: float
+    rule_version: str
+
+    class Config:
+        from_attributes = True
+
+
+class InputVersionOut(BaseModel):
+    id: int
+    version_no: str
+    enterprise_id: int
+    year: int
+    version_seq: int
+    source: str
+    submitter: str
+    evidence_doc_no: Optional[str] = None
+    remark: Optional[str] = None
+    content_hash: str
+    is_sealed: bool
+    created_at: datetime
+    items: List[InputVersionItemOut] = []
+    limit_snapshot: Optional[LimitStandardSnapshotOut] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SealResultItemOut(BaseModel):
+    id: int
+    enterprise_id: int
+    vehicle_model_id: int
+    input_version_id: int
+    year: int
+    power_consumption_limit: float
+    actual_power_consumption: float
+    unit_credit: float
+    annual_output: int
+    total_credit: float
+
+    class Config:
+        from_attributes = True
+
+
+class SealEnterpriseSummaryOut(BaseModel):
+    id: int
+    enterprise_id: int
+    input_version_id: int
+    year: int
+    total_positive_credit: float
+    total_negative_credit: float
+    net_credit: float
+    credit_gap: float
+    credit_surplus: float
+    model_count: int
+
+    class Config:
+        from_attributes = True
+
+
+class SealCreate(BaseModel):
+    year: int
+    confirmed_by: str = Field(..., max_length=100, description="封账确认监管人员")
+    remark: Optional[str] = None
+
+
+class SealOut(BaseModel):
+    id: int
+    seal_no: str
+    year: int
+    seal_seq: int
+    status: str
+    input_version_id: int
+    confirmed_by: str
+    sealed_at: datetime
+    remark: Optional[str] = None
+    superseded_by_seal_id: Optional[int] = None
+    reopen_decision_id: Optional[int] = None
+    result_items: List[SealResultItemOut] = []
+    enterprise_summaries: List[SealEnterpriseSummaryOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ReopenCreate(BaseModel):
+    decision_no: str = Field(..., max_length=64, description="重开决定单号（幂等键，重复执行不再生成新版本）")
+    year: Optional[int] = Field(None, description="封账年度；不传则取当前生效封账")
+    base_seal_id: Optional[int] = Field(None, description="被重开的原封账ID")
+    reason: str = Field(..., min_length=1, description="重开理由")
+    requested_by: str = Field(..., max_length=100, description="申请人")
+    approved_by: str = Field(..., max_length=100, description="批准人（监管权限）")
+    authority_role: str = Field(..., max_length=100, description="批准权限/角色")
+    enterprise_ids: List[int] = Field(..., min_length=1, description="受影响企业")
+    input_version_id: Optional[int] = Field(None, description="统一指定重算依据的输入版本")
+    version_by_enterprise: Optional[Dict[int, int]] = Field(
+        None, description="按企业分别指定输入版本，优先级高于 input_version_id"
+    )
+
+
+class ReopenAffectedEnterpriseOut(BaseModel):
+    id: int
+    enterprise_id: int
+    recalc_status: str
+    fail_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RecalcDifferenceItemOut(BaseModel):
+    id: int
+    enterprise_id: int
+    vehicle_model_id: Optional[int] = None
+    item_name: str
+    old_value: float
+    new_value: float
+    delta: float
+
+    class Config:
+        from_attributes = True
+
+
+class ReopenOut(BaseModel):
+    id: int
+    decision_no: str
+    year: int
+    base_seal_id: int
+    reason: str
+    requested_by: str
+    approved_by: str
+    authority_role: str
+    input_version_id: int
+    status: str
+    executed_at: Optional[datetime] = None
+    new_seal_id: Optional[int] = None
+    created_at: datetime
+    affected_enterprises: List[ReopenAffectedEnterpriseOut] = []
+    differences: List[RecalcDifferenceItemOut] = []
+
+    class Config:
+        from_attributes = True

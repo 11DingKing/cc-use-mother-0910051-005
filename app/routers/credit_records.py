@@ -11,7 +11,10 @@ router = APIRouter(prefix="/credit-records", tags=["credit-records"])
 
 @router.post("/calculate/{year}", response_model=List[schemas.CalculationResult])
 def calculate_all_credits(year: int, db: Session = Depends(get_db)):
-    records = crud.batch_calculate_credits(db, year=year)
+    try:
+        records = crud.batch_calculate_credits(db, year=year)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     results = []
     for record in records:
         model = crud.get_vehicle_model(db, model_id=record.vehicle_model_id)

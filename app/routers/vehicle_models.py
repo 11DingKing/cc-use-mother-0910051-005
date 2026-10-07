@@ -17,7 +17,10 @@ def create_vehicle_model(model: schemas.VehicleModelCreate, db: Session = Depend
     db_enterprise = crud.get_enterprise(db, enterprise_id=model.enterprise_id)
     if not db_enterprise:
         raise HTTPException(status_code=400, detail="所属企业不存在")
-    return crud.create_vehicle_model(db=db, model=model)
+    try:
+        return crud.create_vehicle_model(db=db, model=model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/", response_model=List[schemas.VehicleModelWithEnterprise])
@@ -60,7 +63,10 @@ def update_vehicle_model(
     model_update: schemas.VehicleModelUpdate,
     db: Session = Depends(get_db)
 ):
-    db_model = crud.update_vehicle_model(db, model_id, model_update)
+    try:
+        db_model = crud.update_vehicle_model(db, model_id, model_update)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if db_model is None:
         raise HTTPException(status_code=404, detail="车型不存在")
     return db_model
@@ -68,7 +74,10 @@ def update_vehicle_model(
 
 @router.delete("/{model_id}")
 def delete_vehicle_model(model_id: int, db: Session = Depends(get_db)):
-    success = crud.delete_vehicle_model(db, model_id)
+    try:
+        success = crud.delete_vehicle_model(db, model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not success:
         raise HTTPException(status_code=404, detail="车型不存在")
     return {"message": "删除成功"}
